@@ -2,6 +2,7 @@
 
 import rospy
 import cv2
+import cv_bridge
 import torch
 import torch.backends.cudnn as cudnn
 import numpy as np
@@ -9,11 +10,11 @@ from cv_bridge import CvBridge
 from pathlib import Path
 import os
 import sys
+from std_msgs.msg import Float64
 from rostopic import get_topic_type
-
+from matplotlib import pyplot as plt 
 from sensor_msgs.msg import Image, CompressedImage
 from detection_msgs.msg import BoundingBox, BoundingBoxes
-
 
 # add yolov5 submodule to path
 FILE = Path(__file__).resolve()
@@ -45,6 +46,7 @@ class Yolov5Detector:
         self.classes = rospy.get_param("~classes", None)
         self.line_thickness = rospy.get_param("~line_thickness")
         self.view_image = rospy.get_param("~view_image")
+        self.previous_spped = -1
         # Initialize weights 
         weights = rospy.get_param("~weights")
         # Initialize model
@@ -89,13 +91,14 @@ class Yolov5Detector:
 
         # Initialize prediction publisher
         self.pred_pub = rospy.Publisher(
-            rospy.get_param("~output_topic"), BoundingBoxes, queue_size=10
+            # rospy.get_param("~output_topic"), BoundingBoxes, queue_size=1
+            rospy.get_param("~output_topic"), Float64, queue_size=1
         )
         # Initialize image publisher
         self.publish_image = rospy.get_param("~publish_image")
         if self.publish_image:
             self.image_pub = rospy.Publisher(
-                rospy.get_param("~output_image_topic"), Image, queue_size=10
+                rospy.get_param("~output_image_topic"), Image, queue_size=1
             )
         
         # Initialize CV_Bridge
@@ -103,16 +106,32 @@ class Yolov5Detector:
 
     def callback(self, data):
         """adapted from yolov5/detect.py"""
-        # print(data.header)
         if self.compressed_input:
             im = self.bridge.compressed_imgmsg_to_cv2(data, desired_encoding="bgr8")
         else:
-            im = self.bridge.imgmsg_to_cv2(data, desired_encoding="bgr8")
+            # print(data.header)
+            # print(data.height, ' * ', data.width) # 480 * 848
+            # print(data.encoding) # bgr8
+            # print(data.step) # 2544 = 848 * 3
+            # print(data.is_bigendian) # 0
+            # print(type(data.data)) # <class 'bytes'>
+            # print(len(data.data)) # 1221120
+            
+            data.height = 640
+            data.width = 640
+            data.step = 1920
+            data.encoding = 'rgb'
+            data.is_bigendian = 0
+
+            original_im = np.frombuffer(data.data, dtype=np.uint8)
+
+            im = np.reshape(original_im, (data.height, data.step), 'F')            
+            im = np.reshape(im, (data.height, data.width, 3), 'F')
+            im = im[:, :, [2, 1, 0]]
+
+            # im = np.reshape(original_im, (data.height, data.width, 3))
         
         im, im0 = self.preprocess(im)
-        # print(im.shape)
-        # print(img0.shape)
-        # print(img.shape)
 
         # Run inference
         im = torch.from_numpy(im).to(self.device) 
@@ -125,8 +144,6 @@ class Yolov5Detector:
         pred = non_max_suppression(
             pred, self.conf_thres, self.iou_thres, self.classes, self.agnostic_nms, max_det=self.max_det
         )
-
-        ### To-do move pred to CPU and fill BoundingBox messages
         
         # Process predictions 
         det = pred[0].cpu().numpy()
@@ -160,18 +177,25 @@ class Yolov5Detector:
                     label = f"{self.names[c]} {conf:.2f}"
                     annotator.box_label(xyxy, label, color=colors(c, True))       
 
-                
-                ### POPULATE THE DETECTION MESSAGE HERE
-
             # Stream results
             im0 = annotator.result()
 
         # Publish prediction
-        self.pred_pub.publish(bounding_boxes)
+        if len(bounding_boxes.bounding_boxes):
+            for boundingbox in bounding_boxes.bounding_boxes:
+                print(boundingbox.Class)
+                if boundingbox.Class != self.previous_spped:
+                    if boundingbox.Class.startswith("Speed Limit"):
+                        speed = int(boundingbox.Class.split()[2])
+                        self.pred_pub.publish(speed)
+                        self.previous_spped = boundingbox.Class
+                    elif boundingbox.Class == "Stop" or boundingbox.Class == "Red Light":
+                        self.pred_pub.publish(0)
+                        self.previous_spped = boundingbox.Class
 
         # Publish & visualize images
         if self.view_image:
-            cv2.imshow(str(0), im0)
+            cv2.imshow("Detection", im0)
             cv2.waitKey(1)  # 1 millisecond
         if self.publish_image:
             self.image_pub.publish(self.bridge.cv2_to_imgmsg(im0, "bgr8"))
@@ -187,13 +211,13 @@ class Yolov5Detector:
         img = img[..., ::-1].transpose((0, 3, 1, 2))  # BGR to RGB, BHWC to BCHW
         img = np.ascontiguousarray(img)
 
-        return img, img0 
+        return img, img0
 
 
 if __name__ == "__main__":
 
     check_requirements(exclude=("tensorboard", "thop"))
-    
+
     rospy.init_node("yolov5", anonymous=True)
     detector = Yolov5Detector()
     
